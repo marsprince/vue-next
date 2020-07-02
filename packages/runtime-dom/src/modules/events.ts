@@ -1,4 +1,4 @@
-import { isArray, EMPTY_OBJ } from '@vue/shared'
+import { EMPTY_OBJ, isArray } from '@vue/shared'
 import {
   ComponentInternalInstance,
   callWithAsyncErrorHandling
@@ -17,7 +17,6 @@ type EventValue = (Function | Function[]) & {
 type EventValueWithOptions = {
   handler: EventValue
   options: AddEventListenerOptions
-  persistent?: boolean
   invoker?: Invoker | null
 }
 
@@ -25,7 +24,7 @@ type EventValueWithOptions = {
 let _getNow: () => number = Date.now
 
 // Determine what event timestamp the browser is using. Annoyingly, the
-// timestamp can either be hi-res ( relative to page load) or low-res
+// timestamp can either be hi-res (relative to page load) or low-res
 // (relative to UNIX epoch), so in order to compare time we have to use the
 // same timestamp type when saving the flush timestamp.
 if (
@@ -47,22 +46,39 @@ const reset = () => {
 }
 const getNow = () => cachedNow || (p.then(reset), (cachedNow = _getNow()))
 
+export function addEventListener(
+  el: Element,
+  event: string,
+  handler: EventListener,
+  options?: EventListenerOptions
+) {
+  el.addEventListener(event, handler, options)
+}
+
+export function removeEventListener(
+  el: Element,
+  event: string,
+  handler: EventListener,
+  options?: EventListenerOptions
+) {
+  el.removeEventListener(event, handler, options)
+}
+
 export function patchEvent(
   el: Element,
-  name: string,
+  rawName: string,
   prevValue: EventValueWithOptions | EventValue | null,
   nextValue: EventValueWithOptions | EventValue | null,
   instance: ComponentInternalInstance | null = null
 ) {
+  const name = rawName.slice(2).toLowerCase()
   const prevOptions = prevValue && 'options' in prevValue && prevValue.options
   const nextOptions = nextValue && 'options' in nextValue && nextValue.options
   const invoker = prevValue && prevValue.invoker
   const value =
     nextValue && 'handler' in nextValue ? nextValue.handler : nextValue
-  const persistent =
-    nextValue && 'persistent' in nextValue && nextValue.persistent
 
-  if (!persistent && (prevOptions || nextOptions)) {
+  if (prevOptions || nextOptions) {
     const prev = prevOptions || EMPTY_OBJ
     const next = nextOptions || EMPTY_OBJ
     if (
@@ -71,12 +87,12 @@ export function patchEvent(
       prev.once !== next.once
     ) {
       if (invoker) {
-        el.removeEventListener(name, invoker as any, prevOptions as any)
+        removeEventListener(el, name, invoker, prev)
       }
       if (nextValue && value) {
         const invoker = createInvoker(value, instance)
         nextValue.invoker = invoker
-        el.addEventListener(name, invoker, nextOptions as any)
+        addEventListener(el, name, invoker, next)
       }
       return
     }
@@ -89,19 +105,20 @@ export function patchEvent(
       nextValue.invoker = invoker
       invoker.lastUpdated = getNow()
     } else {
-      el.addEventListener(
+      addEventListener(
+        el,
         name,
         createInvoker(value, instance),
-        nextOptions as any
+        nextOptions || void 0
       )
     }
   } else if (invoker) {
-    el.removeEventListener(name, invoker, prevOptions as any)
+    removeEventListener(el, name, invoker, prevOptions || void 0)
   }
 }
 
 function createInvoker(
-  initialValue: any,
+  initialValue: EventValue,
   instance: ComponentInternalInstance | null
 ) {
   const invoker: Invoker = (e: Event) => {
@@ -111,30 +128,34 @@ function createInvoker(
     // the solution is simple: we save the timestamp when a handler is attached,
     // and the handler would only fire if the event passed to it was fired
     // AFTER it was attached.
-    if (e.timeStamp >= invoker.lastUpdated - 1) {
-      const args = [e]
-      const value = invoker.value
-      if (isArray(value)) {
-        for (let i = 0; i < value.length; i++) {
-          callWithAsyncErrorHandling(
-            value[i],
-            instance,
-            ErrorCodes.NATIVE_EVENT_HANDLER,
-            args
-          )
-        }
-      } else {
-        callWithAsyncErrorHandling(
-          value,
-          instance,
-          ErrorCodes.NATIVE_EVENT_HANDLER,
-          args
-        )
-      }
+    const timeStamp = e.timeStamp || _getNow()
+    if (timeStamp >= invoker.lastUpdated - 1) {
+      callWithAsyncErrorHandling(
+        patchStopImmediatePropagation(e, invoker.value),
+        instance,
+        ErrorCodes.NATIVE_EVENT_HANDLER,
+        [e]
+      )
     }
   }
   invoker.value = initialValue
   initialValue.invoker = invoker
   invoker.lastUpdated = getNow()
   return invoker
+}
+
+function patchStopImmediatePropagation(
+  e: Event,
+  value: EventValue
+): EventValue {
+  if (isArray(value)) {
+    const originalStop = e.stopImmediatePropagation
+    e.stopImmediatePropagation = () => {
+      originalStop.call(e)
+      ;(e as any)._stopped = true
+    }
+    return value.map(fn => (e: Event) => !(e as any)._stopped && fn(e))
+  } else {
+    return value
+  }
 }
