@@ -30,20 +30,33 @@ import {
   OPEN_BLOCK,
   TELEPORT
 } from '../runtimeHelpers'
-import { injectProp } from '../utils'
+import { injectProp, findDir, findProp } from '../utils'
 import { PatchFlags, PatchFlagNames } from '@vue/shared'
 
 export const transformIf = createStructuralDirectiveTransform(
   /^(if|else|else-if)$/,
   (node, dir, context) => {
     return processIf(node, dir, context, (ifNode, branch, isRoot) => {
+      // #1587: We need to dynamically increment the key based on the current
+      // node's sibling nodes, since chained v-if/else branches are
+      // rendered at the same depth
+      const siblings = context.parent!.children
+      let i = siblings.indexOf(ifNode)
+      let key = 0
+      while (i-- >= 0) {
+        const sibling = siblings[i]
+        if (sibling && sibling.type === NodeTypes.IF) {
+          key += sibling.branches.length
+        }
+      }
+
       // Exit callback. Complete the codegenNode when all children have been
       // transformed.
       return () => {
         if (isRoot) {
           ifNode.codegenNode = createCodegenNodeForBranch(
             branch,
-            0,
+            key,
             context
           ) as IfConditionalExpression
         } else {
@@ -57,7 +70,7 @@ export const transformIf = createStructuralDirectiveTransform(
           }
           parentCondition.alternate = createCodegenNodeForBranch(
             branch,
-            ifNode.branches.length - 1,
+            key + ifNode.branches.length - 1,
             context
           )
         }
@@ -96,6 +109,11 @@ export function processIf(
 
   if (__DEV__ && __BROWSER__ && dir.exp) {
     validateBrowserExpression(dir.exp as SimpleExpressionNode, context)
+  }
+
+  const userKey = /*#__PURE__*/ findProp(node, 'key')
+  if (userKey) {
+    context.onError(createCompilerError(ErrorCodes.X_V_IF_KEY, userKey.loc))
   }
 
   if (dir.name === 'if') {
@@ -153,19 +171,22 @@ function createIfBranch(node: ElementNode, dir: DirectiveNode): IfBranchNode {
     type: NodeTypes.IF_BRANCH,
     loc: node.loc,
     condition: dir.name === 'else' ? undefined : dir.exp,
-    children: node.tagType === ElementTypes.TEMPLATE ? node.children : [node]
+    children:
+      node.tagType === ElementTypes.TEMPLATE && !findDir(node, 'for')
+        ? node.children
+        : [node]
   }
 }
 
 function createCodegenNodeForBranch(
   branch: IfBranchNode,
-  index: number,
+  keyIndex: number,
   context: TransformContext
 ): IfConditionalExpression | BlockCodegenNode {
   if (branch.condition) {
     return createConditionalExpression(
       branch.condition,
-      createChildrenCodegenNode(branch, index, context),
+      createChildrenCodegenNode(branch, keyIndex, context),
       // make sure to pass in asBlock: true so that the comment node call
       // closes the current block.
       createCallExpression(context.helper(CREATE_COMMENT), [
@@ -174,19 +195,19 @@ function createCodegenNodeForBranch(
       ])
     ) as IfConditionalExpression
   } else {
-    return createChildrenCodegenNode(branch, index, context)
+    return createChildrenCodegenNode(branch, keyIndex, context)
   }
 }
 
 function createChildrenCodegenNode(
   branch: IfBranchNode,
-  index: number,
+  keyIndex: number,
   context: TransformContext
 ): BlockCodegenNode {
   const { helper } = context
   const keyProperty = createObjectProperty(
     `key`,
-    createSimpleExpression(index + '', false)
+    createSimpleExpression(`${keyIndex}`, false)
   )
   const { children } = branch
   const firstChild = children[0]

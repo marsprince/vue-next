@@ -6,16 +6,17 @@ import {
   hasOwn,
   isGloballyWhitelisted,
   NOOP,
-  extend
+  extend,
+  isString
 } from '@vue/shared'
 import {
   ReactiveEffect,
-  UnwrapRef,
   toRaw,
   shallowReadonly,
   ReactiveFlags,
   track,
-  TrackOpTypes
+  TrackOpTypes,
+  ShallowUnwrapRef
 } from '@vue/reactivity'
 import {
   ExtractComputedReturns,
@@ -154,7 +155,7 @@ export type ComponentPublicInstance<
   $nextTick: typeof nextTick
   $watch: typeof instanceWatch
 } & P &
-  UnwrapRef<B> &
+  ShallowUnwrapRef<B> &
   D &
   ExtractComputedReturns<C> &
   M &
@@ -179,10 +180,10 @@ const publicPropertiesMap: PublicPropertiesMap = extend(Object.create(null), {
   $parent: i => i.parent && i.parent.proxy,
   $root: i => i.root && i.root.proxy,
   $emit: i => i.emit,
-  $options: i => (__FEATURE_OPTIONS__ ? resolveMergedOptions(i) : i.type),
+  $options: i => (__FEATURE_OPTIONS_API__ ? resolveMergedOptions(i) : i.type),
   $forceUpdate: i => () => queueJob(i.update),
   $nextTick: () => nextTick,
-  $watch: __FEATURE_OPTIONS__ ? i => instanceWatch.bind(i) : NOOP
+  $watch: i => (__FEATURE_OPTIONS_API__ ? instanceWatch.bind(i) : NOOP)
 } as PublicPropertiesMap)
 
 const enum AccessTypes {
@@ -286,9 +287,10 @@ export const PublicInstanceProxyHandlers: ProxyHandler<any> = {
     } else if (
       __DEV__ &&
       currentRenderingInstance &&
-      // #1091 avoid internal isRef/isVNode checks on component instance leading
-      // to infinite warning loop
-      key.indexOf('__v') !== 0
+      (!isString(key) ||
+        // #1091 avoid internal isRef/isVNode checks on component instance leading
+        // to infinite warning loop
+        key.indexOf('__v') !== 0)
     ) {
       if (data !== EMPTY_OBJ && key[0] === '$' && hasOwn(data, key)) {
         warn(
