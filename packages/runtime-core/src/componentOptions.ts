@@ -3,9 +3,10 @@ import {
   Data,
   SetupContext,
   ComponentInternalOptions,
-  PublicAPIComponent,
   Component,
-  InternalRenderFunction
+  ConcreteComponent,
+  InternalRenderFunction,
+  LifecycleHooks
 } from './component'
 import {
   isFunction,
@@ -40,21 +41,24 @@ import {
   reactive,
   ComputedGetter,
   WritableComputedOptions,
-  toRaw
+  toRaw,
+  proxyRefs,
+  toRef
 } from '@vue/reactivity'
 import {
   ComponentObjectPropsOptions,
   ExtractPropTypes,
-  normalizePropsOptions
+  ExtractDefaultPropTypes
 } from './componentProps'
 import { EmitsOptions } from './componentEmits'
 import { Directive } from './directives'
 import {
   CreateComponentPublicInstance,
   ComponentPublicInstance
-} from './componentProxy'
+} from './componentPublicInstance'
 import { warn } from './warning'
 import { VNodeChild } from './vnode'
+import { callWithAsyncErrorHandling } from './errorHandling'
 
 /**
  * Interface for declaring custom options.
@@ -85,7 +89,8 @@ export interface ComponentOptionsBase<
   Mixin extends ComponentOptionsMixin,
   Extends extends ComponentOptionsMixin,
   E extends EmitsOptions,
-  EE extends string = string
+  EE extends string = string,
+  Defaults = {}
 >
   extends LegacyOptions<Props, D, C, M, Mixin, Extends>,
     ComponentInternalOptions,
@@ -93,8 +98,8 @@ export interface ComponentOptionsBase<
   setup?: (
     this: void,
     props: Props,
-    ctx: SetupContext<E>
-  ) => RawBindings | RenderFunction | void
+    ctx: SetupContext<E, Props>
+  ) => Promise<RawBindings> | RawBindings | RenderFunction | void
   name?: string
   template?: string | object // can be a direct DOM node
   // Note: we are intentionally using the signature-less `Function` type here
@@ -103,10 +108,13 @@ export interface ComponentOptionsBase<
   // Luckily `render()` doesn't need any arguments nor does it care about return
   // type.
   render?: Function
-  components?: Record<string, PublicAPIComponent>
+  components?: Record<string, Component>
   directives?: Record<string, Directive>
   inheritAttrs?: boolean
-  emits?: E | EE[]
+  emits?: (E | EE[]) & ThisType<void>
+  // TODO infer public instance type based on exposed keys
+  expose?: string[]
+  serverPrefetch?(): Promise<any>
 
   // Internal ------------------------------------------------------------------
 
@@ -132,7 +140,7 @@ export interface ComponentOptionsBase<
    * marker for AsyncComponentWrapper
    * @internal
    */
-  __asyncLoader?: () => Promise<Component>
+  __asyncLoader?: () => Promise<ConcreteComponent>
   /**
    * cache for merged $options
    * @internal
@@ -151,6 +159,8 @@ export interface ComponentOptionsBase<
   __isFragment?: never
   __isTeleport?: never
   __isSuspense?: never
+
+  __defaults?: Defaults
 }
 
 export type ComponentOptionsWithoutProps<
@@ -163,20 +173,21 @@ export type ComponentOptionsWithoutProps<
   Extends extends ComponentOptionsMixin = ComponentOptionsMixin,
   E extends EmitsOptions = EmitsOptions,
   EE extends string = string
-> = ComponentOptionsBase<Props, RawBindings, D, C, M, Mixin, Extends, E, EE> & {
+> = ComponentOptionsBase<
+  Props,
+  RawBindings,
+  D,
+  C,
+  M,
+  Mixin,
+  Extends,
+  E,
+  EE,
+  {}
+> & {
   props?: undefined
 } & ThisType<
-    CreateComponentPublicInstance<
-      {},
-      RawBindings,
-      D,
-      C,
-      M,
-      Mixin,
-      Extends,
-      E,
-      Readonly<Props>
-    >
+    CreateComponentPublicInstance<{}, RawBindings, D, C, M, Mixin, Extends, E>
   >
 
 export type ComponentOptionsWithArrayProps<
@@ -190,7 +201,18 @@ export type ComponentOptionsWithArrayProps<
   E extends EmitsOptions = EmitsOptions,
   EE extends string = string,
   Props = Readonly<{ [key in PropNames]?: any }>
-> = ComponentOptionsBase<Props, RawBindings, D, C, M, Mixin, Extends, E, EE> & {
+> = ComponentOptionsBase<
+  Props,
+  RawBindings,
+  D,
+  C,
+  M,
+  Mixin,
+  Extends,
+  E,
+  EE,
+  {}
+> & {
   props: PropNames[]
 } & ThisType<
     CreateComponentPublicInstance<
@@ -215,9 +237,21 @@ export type ComponentOptionsWithObjectProps<
   Extends extends ComponentOptionsMixin = ComponentOptionsMixin,
   E extends EmitsOptions = EmitsOptions,
   EE extends string = string,
-  Props = Readonly<ExtractPropTypes<PropsOptions>>
-> = ComponentOptionsBase<Props, RawBindings, D, C, M, Mixin, Extends, E, EE> & {
-  props: PropsOptions
+  Props = Readonly<ExtractPropTypes<PropsOptions>>,
+  Defaults = ExtractDefaultPropTypes<PropsOptions>
+> = ComponentOptionsBase<
+  Props,
+  RawBindings,
+  D,
+  C,
+  M,
+  Mixin,
+  Extends,
+  E,
+  EE,
+  Defaults
+> & {
+  props: PropsOptions & ThisType<void>
 } & ThisType<
     CreateComponentPublicInstance<
       Props,
@@ -227,16 +261,39 @@ export type ComponentOptionsWithObjectProps<
       M,
       Mixin,
       Extends,
-      E
+      E,
+      Props,
+      Defaults,
+      false
     >
   >
 
-export type ComponentOptions =
-  | ComponentOptionsWithoutProps<any, any, any, any, any>
-  | ComponentOptionsWithObjectProps<any, any, any, any, any>
-  | ComponentOptionsWithArrayProps<any, any, any, any, any>
+export type ComponentOptions<
+  Props = {},
+  RawBindings = any,
+  D = any,
+  C extends ComputedOptions = any,
+  M extends MethodOptions = any,
+  Mixin extends ComponentOptionsMixin = any,
+  Extends extends ComponentOptionsMixin = any,
+  E extends EmitsOptions = any
+> = ComponentOptionsBase<Props, RawBindings, D, C, M, Mixin, Extends, E> &
+  ThisType<
+    CreateComponentPublicInstance<
+      {},
+      RawBindings,
+      D,
+      C,
+      M,
+      Mixin,
+      Extends,
+      E,
+      Readonly<Props>
+    >
+  >
 
 export type ComponentOptionsMixin = ComponentOptionsBase<
+  any,
   any,
   any,
   any,
@@ -266,7 +323,7 @@ export type ExtractComputedReturns<T extends any> = {
 type WatchOptionItem =
   | string
   | WatchCallback
-  | { handler: WatchCallback } & WatchOptions
+  | { handler: WatchCallback | string } & WatchOptions
 
 type ComponentWatchOptionItem = WatchOptionItem | WatchOptionItem[]
 
@@ -276,7 +333,7 @@ type ComponentInjectOptions =
   | string[]
   | Record<
       string | symbol,
-      string | symbol | { from: string | symbol; default?: unknown }
+      string | symbol | { from?: string | symbol; default?: unknown }
     >
 
 interface LegacyOptions<
@@ -317,7 +374,11 @@ interface LegacyOptions<
   updated?(): void
   activated?(): void
   deactivated?(): void
+  /** @deprecated use `beforeUnmount` instead */
+  beforeDestroy?(): void
   beforeUnmount?(): void
+  /** @deprecated use `unmounted` instead */
+  destroyed?(): void
   unmounted?(): void
   renderTracked?: DebuggerHook
   renderTriggered?: DebuggerHook
@@ -327,20 +388,22 @@ interface LegacyOptions<
   delimiters?: [string, string]
 }
 
-export type OptionTypesKeys = 'P' | 'B' | 'D' | 'C' | 'M'
+export type OptionTypesKeys = 'P' | 'B' | 'D' | 'C' | 'M' | 'Defaults'
 
 export type OptionTypesType<
   P = {},
   B = {},
   D = {},
   C extends ComputedOptions = {},
-  M extends MethodOptions = {}
+  M extends MethodOptions = {},
+  Defaults = {}
 > = {
   P: P
   B: B
   D: D
   C: C
   M: M
+  Defaults: Defaults
 }
 
 const enum OptionTypes {
@@ -364,11 +427,14 @@ function createDuplicateChecker() {
 
 type DataFn = (vm: ComponentPublicInstance) => any
 
+export let isInBeforeCreate = false
+
 export function applyOptions(
   instance: ComponentInternalInstance,
   options: ComponentOptions,
   deferredData: DataFn[] = [],
   deferredWatch: ComponentWatchOptions[] = [],
+  deferredProvide: (Data | Function)[] = [],
   asMixin: boolean = false
 ) {
   const {
@@ -382,6 +448,9 @@ export function applyOptions(
     watch: watchOptions,
     provide: provideOptions,
     inject: injectOptions,
+    // assets
+    components,
+    directives,
     // lifecycle
     beforeMount,
     mounted,
@@ -389,12 +458,16 @@ export function applyOptions(
     updated,
     activated,
     deactivated,
+    beforeDestroy,
     beforeUnmount,
+    destroyed,
     unmounted,
     render,
     renderTracked,
     renderTriggered,
-    errorCaptured
+    errorCaptured,
+    // public API
+    expose
   } = options
 
   const publicThis = instance.proxy!
@@ -407,24 +480,45 @@ export function applyOptions(
 
   // applyOptions is called non-as-mixin once per instance
   if (!asMixin) {
-    callSyncHook('beforeCreate', options, publicThis, globalMixins)
+    isInBeforeCreate = true
+    callSyncHook(
+      'beforeCreate',
+      LifecycleHooks.BEFORE_CREATE,
+      options,
+      instance,
+      globalMixins
+    )
+    isInBeforeCreate = false
     // global mixins are applied first
-    applyMixins(instance, globalMixins, deferredData, deferredWatch)
+    applyMixins(
+      instance,
+      globalMixins,
+      deferredData,
+      deferredWatch,
+      deferredProvide
+    )
   }
 
   // extending a base component...
   if (extendsOptions) {
-    applyOptions(instance, extendsOptions, deferredData, deferredWatch, true)
+    applyOptions(
+      instance,
+      extendsOptions,
+      deferredData,
+      deferredWatch,
+      deferredProvide,
+      true
+    )
   }
   // local mixins
   if (mixins) {
-    applyMixins(instance, mixins, deferredData, deferredWatch)
+    applyMixins(instance, mixins, deferredData, deferredWatch, deferredProvide)
   }
 
   const checkDuplicateProperties = __DEV__ ? createDuplicateChecker() : null
 
   if (__DEV__) {
-    const propsOptions = normalizePropsOptions(options)[0]
+    const [propsOptions] = instance.propsOptions
     if (propsOptions) {
       for (const key in propsOptions) {
         checkDuplicateProperties!(OptionTypes.PROPS, key)
@@ -453,7 +547,11 @@ export function applyOptions(
       for (const key in injectOptions) {
         const opt = injectOptions[key]
         if (isObject(opt)) {
-          ctx[key] = inject(opt.from, opt.default)
+          ctx[key] = inject(
+            opt.from || key,
+            opt.default,
+            true /* treat default function as factory */
+          )
         } else {
           ctx[key] = inject(opt)
         }
@@ -481,23 +579,12 @@ export function applyOptions(
     }
   }
 
-  if (dataOptions) {
-    if (__DEV__ && !isFunction(dataOptions)) {
-      warn(
-        `The data option must be a function. ` +
-          `Plain object usage is no longer supported.`
-      )
-    }
-
-    if (asMixin) {
-      deferredData.push(dataOptions as DataFn)
-    } else {
-      resolveData(instance, dataOptions, publicThis)
-    }
-  }
   if (!asMixin) {
     if (deferredData.length) {
       deferredData.forEach(dataFn => resolveData(instance, dataFn, publicThis))
+    }
+    if (dataOptions) {
+      resolveData(instance, dataOptions, publicThis)
     }
     if (__DEV__) {
       const rawData = toRaw(instance.data)
@@ -514,6 +601,8 @@ export function applyOptions(
         }
       }
     }
+  } else if (dataOptions) {
+    deferredData.push(dataOptions as DataFn)
   }
 
   if (computedOptions) {
@@ -565,17 +654,54 @@ export function applyOptions(
   }
 
   if (provideOptions) {
-    const provides = isFunction(provideOptions)
-      ? provideOptions.call(publicThis)
-      : provideOptions
-    for (const key in provides) {
-      provide(key, provides[key])
+    deferredProvide.push(provideOptions)
+  }
+  if (!asMixin && deferredProvide.length) {
+    deferredProvide.forEach(provideOptions => {
+      const provides = isFunction(provideOptions)
+        ? provideOptions.call(publicThis)
+        : provideOptions
+      for (const key in provides) {
+        provide(key, provides[key])
+      }
+    })
+  }
+
+  // asset options.
+  // To reduce memory usage, only components with mixins or extends will have
+  // resolved asset registry attached to instance.
+  if (asMixin) {
+    if (components) {
+      extend(
+        instance.components ||
+          (instance.components = extend(
+            {},
+            (instance.type as ComponentOptions).components
+          ) as Record<string, ConcreteComponent>),
+        components
+      )
+    }
+    if (directives) {
+      extend(
+        instance.directives ||
+          (instance.directives = extend(
+            {},
+            (instance.type as ComponentOptions).directives
+          )),
+        directives
+      )
     }
   }
 
   // lifecycle options
   if (!asMixin) {
-    callSyncHook('created', options, publicThis, globalMixins)
+    callSyncHook(
+      'created',
+      LifecycleHooks.CREATED,
+      options,
+      instance,
+      globalMixins
+    )
   }
   if (beforeMount) {
     onBeforeMount(beforeMount.bind(publicThis))
@@ -604,44 +730,85 @@ export function applyOptions(
   if (renderTriggered) {
     onRenderTriggered(renderTriggered.bind(publicThis))
   }
+  if (__DEV__ && beforeDestroy) {
+    warn(`\`beforeDestroy\` has been renamed to \`beforeUnmount\`.`)
+  }
   if (beforeUnmount) {
     onBeforeUnmount(beforeUnmount.bind(publicThis))
   }
+  if (__DEV__ && destroyed) {
+    warn(`\`destroyed\` has been renamed to \`unmounted\`.`)
+  }
   if (unmounted) {
     onUnmounted(unmounted.bind(publicThis))
+  }
+
+  if (isArray(expose)) {
+    if (!asMixin) {
+      if (expose.length) {
+        const exposed = instance.exposed || (instance.exposed = proxyRefs({}))
+        expose.forEach(key => {
+          exposed[key] = toRef(publicThis, key as any)
+        })
+      } else if (!instance.exposed) {
+        instance.exposed = EMPTY_OBJ
+      }
+    } else if (__DEV__) {
+      warn(`The \`expose\` option is ignored when used in mixins.`)
+    }
   }
 }
 
 function callSyncHook(
   name: 'beforeCreate' | 'created',
+  type: LifecycleHooks,
   options: ComponentOptions,
-  ctx: ComponentPublicInstance,
+  instance: ComponentInternalInstance,
   globalMixins: ComponentOptions[]
 ) {
-  callHookFromMixins(name, globalMixins, ctx)
-  const baseHook = options.extends && options.extends[name]
-  if (baseHook) {
-    baseHook.call(ctx)
+  callHookFromMixins(name, type, globalMixins, instance)
+  const { extends: base, mixins } = options
+  if (base) {
+    callHookFromExtends(name, type, base, instance)
   }
-  const mixins = options.mixins
   if (mixins) {
-    callHookFromMixins(name, mixins, ctx)
+    callHookFromMixins(name, type, mixins, instance)
   }
   const selfHook = options[name]
   if (selfHook) {
-    selfHook.call(ctx)
+    callWithAsyncErrorHandling(selfHook.bind(instance.proxy!), instance, type)
+  }
+}
+
+function callHookFromExtends(
+  name: 'beforeCreate' | 'created',
+  type: LifecycleHooks,
+  base: ComponentOptions,
+  instance: ComponentInternalInstance
+) {
+  if (base.extends) {
+    callHookFromExtends(name, type, base.extends, instance)
+  }
+  const baseHook = base[name]
+  if (baseHook) {
+    callWithAsyncErrorHandling(baseHook.bind(instance.proxy!), instance, type)
   }
 }
 
 function callHookFromMixins(
   name: 'beforeCreate' | 'created',
+  type: LifecycleHooks,
   mixins: ComponentOptions[],
-  ctx: ComponentPublicInstance
+  instance: ComponentInternalInstance
 ) {
   for (let i = 0; i < mixins.length; i++) {
+    const chainedMixins = mixins[i].mixins
+    if (chainedMixins) {
+      callHookFromMixins(name, type, chainedMixins, instance)
+    }
     const fn = mixins[i][name]
     if (fn) {
-      fn.call(ctx)
+      callWithAsyncErrorHandling(fn.bind(instance.proxy!), instance, type)
     }
   }
 }
@@ -650,10 +817,18 @@ function applyMixins(
   instance: ComponentInternalInstance,
   mixins: ComponentOptions[],
   deferredData: DataFn[],
-  deferredWatch: ComponentWatchOptions[]
+  deferredWatch: ComponentWatchOptions[],
+  deferredProvide: (Data | Function)[]
 ) {
   for (let i = 0; i < mixins.length; i++) {
-    applyOptions(instance, mixins[i], deferredData, deferredWatch, true)
+    applyOptions(
+      instance,
+      mixins[i],
+      deferredData,
+      deferredWatch,
+      deferredProvide,
+      true
+    )
   }
 }
 
@@ -662,6 +837,12 @@ function resolveData(
   dataFn: DataFn,
   publicThis: ComponentPublicInstance
 ) {
+  if (__DEV__ && !isFunction(dataFn)) {
+    warn(
+      `The data option must be a function. ` +
+        `Plain object usage is no longer supported.`
+    )
+  }
   const data = dataFn.call(publicThis, publicThis)
   if (__DEV__ && isPromise(data)) {
     warn(
@@ -686,7 +867,9 @@ function createWatcher(
   publicThis: ComponentPublicInstance,
   key: string
 ) {
-  const getter = () => (publicThis as any)[key]
+  const getter = key.includes('.')
+    ? createPathGetter(publicThis, key)
+    : () => (publicThis as any)[key]
   if (isString(raw)) {
     const handler = ctx[raw]
     if (isFunction(handler)) {
@@ -700,10 +883,28 @@ function createWatcher(
     if (isArray(raw)) {
       raw.forEach(r => createWatcher(r, ctx, publicThis, key))
     } else {
-      watch(getter, raw.handler.bind(publicThis), raw)
+      const handler = isFunction(raw.handler)
+        ? raw.handler.bind(publicThis)
+        : (ctx[raw.handler] as WatchCallback)
+      if (isFunction(handler)) {
+        watch(getter, handler, raw)
+      } else if (__DEV__) {
+        warn(`Invalid watch handler specified by key "${raw.handler}"`, handler)
+      }
     }
   } else if (__DEV__) {
-    warn(`Invalid watch option: "${key}"`)
+    warn(`Invalid watch option: "${key}"`, raw)
+  }
+}
+
+function createPathGetter(ctx: any, path: string) {
+  const segments = path.split('.')
+  return () => {
+    let cur = ctx
+    for (let i = 0; i < segments.length && cur; i++) {
+      cur = cur[segments[i]]
+    }
+    return cur
   }
 }
 
@@ -717,18 +918,22 @@ export function resolveMergedOptions(
   if (!globalMixins.length && !mixins && !extendsOptions) return raw
   const options = {}
   globalMixins.forEach(m => mergeOptions(options, m, instance))
-  extendsOptions && mergeOptions(options, extendsOptions, instance)
-  mixins && mixins.forEach(m => mergeOptions(options, m, instance))
   mergeOptions(options, raw, instance)
   return (raw.__merged = options)
 }
 
 function mergeOptions(to: any, from: any, instance: ComponentInternalInstance) {
   const strats = instance.appContext.config.optionMergeStrategies
+  const { mixins, extends: extendsOptions } = from
+
+  extendsOptions && mergeOptions(to, extendsOptions, instance)
+  mixins &&
+    mixins.forEach((m: ComponentOptionsMixin) => mergeOptions(to, m, instance))
+
   for (const key in from) {
     if (strats && hasOwn(strats, key)) {
       to[key] = strats[key](to[key], from[key], instance.proxy, key)
-    } else if (!hasOwn(to, key)) {
+    } else {
       to[key] = from[key]
     }
   }

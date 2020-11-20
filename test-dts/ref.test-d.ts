@@ -1,4 +1,15 @@
-import { Ref, ref, isRef, unref, reactive, expectType } from './index'
+import {
+  Ref,
+  ref,
+  shallowRef,
+  isRef,
+  unref,
+  reactive,
+  expectType,
+  proxyRefs,
+  toRef,
+  toRefs
+} from './index'
 
 function plainType(arg: number | Ref<number>) {
   // ref coercing
@@ -111,3 +122,52 @@ const state = reactive({
 })
 
 expectType<string>(state.foo.label)
+
+// shallowRef
+type Status = 'initial' | 'ready' | 'invalidating'
+const shallowStatus = shallowRef<Status>('initial')
+if (shallowStatus.value === 'initial') {
+  expectType<Ref<Status>>(shallowStatus)
+  expectType<Status>(shallowStatus.value)
+  shallowStatus.value = 'invalidating'
+}
+
+const refStatus = ref<Status>('initial')
+if (refStatus.value === 'initial') {
+  expectType<Ref<Status>>(shallowStatus)
+  expectType<Status>(shallowStatus.value)
+  refStatus.value = 'invalidating'
+}
+
+// proxyRefs: should return `reactive` directly
+const r1 = reactive({
+  k: 'v'
+})
+const p1 = proxyRefs(r1)
+expectType<typeof r1>(p1)
+
+// proxyRefs: `ShallowUnwrapRef`
+const r2 = {
+  a: ref(1),
+  obj: {
+    k: ref('foo')
+  }
+}
+const p2 = proxyRefs(r2)
+expectType<number>(p2.a)
+expectType<Ref<string>>(p2.obj.k)
+
+// toRef
+const obj = {
+  a: 1,
+  b: ref(1)
+}
+expectType<Ref<number>>(toRef(obj, 'a'))
+expectType<Ref<number>>(toRef(obj, 'b'))
+
+// toRefs
+const objRefs = toRefs(obj)
+expectType<{
+  a: Ref<number>
+  b: Ref<number>
+}>(objRefs)
